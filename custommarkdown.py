@@ -19,6 +19,14 @@ class CustomCodeBlock(CodeBlock):
           self.theme = TomorrowNightTheme()
         else:
           self.theme = theme
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        code = str(self.text).rstrip()
+        syntax = Syntax(
+            code, self.lexer_name, theme=self.theme, word_wrap=True, padding=0, tab_size=2
+        )
+        yield syntax
     
 class CustomMarkdownContext(MarkdownContext):
     def __init__(
@@ -31,7 +39,7 @@ class CustomMarkdownContext(MarkdownContext):
     )-> None:
         super().__init__(console, options, style, inline_code_lexer, inline_code_theme)
         if inline_code_theme == "tomorrownighteighties":
-          self._syntax = Syntax("", inline_code_lexer, theme=TomorrowNightTheme())
+          self._syntax = Syntax("", inline_code_lexer, theme=TomorrowNightTheme(), tab_size=2)
         else:
           self._syntax = Syntax("", inline_code_lexer, theme=inline_code_theme)
 

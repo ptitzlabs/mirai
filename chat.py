@@ -1,3 +1,4 @@
+from filecmp import cmp
 import os
 import re
 import subprocess
@@ -18,6 +19,7 @@ from console import fg, bg, fx
 from termcolor import colored
 import shutil
 import textwrap
+from mistralai.models.chat_completion import ChatMessage
 
 from bot_engine import Bot
 
@@ -47,26 +49,56 @@ def main():
   }
   csl = Console(theme=Theme(tomorrow_night_eighties_theme), force_terminal=True)
 
+  def strip_ansi(text):
+    tmp = ""
+    if type(text) == bytes:
+      tmp = text.decode('utf-8')
+    else:
+      tmp = text
+    """Remove ANSI escape sequences from a string."""
+    ansi_escape = re.compile(r'''
+        \x1b   # ESC
+        \[     # [
+        [0-?]* # 0 or more characters in the range 0 to ?
+        [ -/]* # 0 or more characters in the range space to /
+        [@-~]  # one character in the range @ to ~
+    ''', re.VERBOSE)
+    tmp = ansi_escape.sub('', tmp)
+    ansi_escape = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+    return ansi_escape.sub('', tmp)
+
   txt = ""
   curr_completion = -1
   def get_completions(txt):
     cmd = txt.split(' ')
     completions = []
+    raw_completions = []
+    prefix = cmd[-1]
+    if len(cmd) == 1:
+      if len(cmd[0]) > 0 and cmd[0][0] != "$":
+        query = f"bash -ic 'compgen -c {cmd[0]}'"
+        process = subprocess.Popen(query, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+
+        raw_completions = stdout.decode().split('\n')
+        raw_completions = [strip_ansi(item) for item in raw_completions if len(item) > 0]
     if len(cmd) > 1:
-        if shutil.which(cmd[0]) is not None or cmd[0] == "cd":
-            prefix = cmd[-1]
-            if cmd[0] in ["cd", "ls"]:
-                query = f"bash -ic 'compgen -d {prefix}'"
-            else:
-                query = f"bash -ic 'compgen -f {prefix}'"
-            
-            process = subprocess.Popen(query, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
-            
-            # Split the output by new lines and strip the prefix
-            raw_completions = stdout.decode().split('\n')
-            # Use str.startswith to check if the item starts with the prefix and then strip it
-            completions = [item[len(prefix):] if item.startswith(prefix) else item for item in raw_completions if item]
+      if shutil.which(cmd[0]) is not None or cmd[0] == "cd":
+        prefix = cmd[-1]
+        if cmd[0] in ["cd", "ls"]:
+            query = f"bash -ic 'compgen -d {prefix}'"
+        else:
+            query = f"bash -ic 'compgen -f {prefix}'"
+        
+        process = subprocess.Popen(query, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        
+        raw_completions = stdout.decode().split('\n')
+        raw_completions = [strip_ansi(item) for item in raw_completions if len(item) > 0]
+        if len(prefix) == 0 or prefix[0] != ".":
+            raw_completions = [item for item in raw_completions if item[0] != "."]
+    raw_completions.sort()
+    completions = [item[len(prefix):] if item.startswith(prefix) else item for item in raw_completions if item]
 
     return completions
 
@@ -76,10 +108,12 @@ def main():
     nonlocal txt
     nonlocal curr_completion
     nonlocal completions_orig
-    event.app.current_buffer.insert_text(event.data)
-    txt = event.app.current_buffer.text
-    curr_completion = -1
-    completions_orig = txt
+    # if event.key != Keys.Tab:
+    if re.match(r'^[\x20-\x7E]+$', event.data):
+      event.app.current_buffer.insert_text(event.data)
+      txt = event.app.current_buffer.text
+      curr_completion = -1
+      completions_orig = txt
 
   @kb.add(Keys.Tab)
   def handle_tab(event):
@@ -88,6 +122,7 @@ def main():
     if curr_completion == -1:
       completions_orig = txt
     completions = get_completions(completions_orig)
+    # pprint.pprint(completions)
     if len(completions) > 0:
       curr_completion = (curr_completion + 1) % len(completions)
       line = completions_orig + completions[curr_completion]
@@ -103,34 +138,55 @@ def main():
     pass
   
 
+  last_output = ""
   def process_input(input):
+    nonlocal last_output
     curr_completion = -1
     cmd = input.split(" ")
     res_txt = ""
     res_obj = {}
     # if cmd[0] == "switch":
     #   res = cmd_switch(input)
-    if cmd[0] == "change_instruction":
+    if cmd[0] == "$context":
+      messages = [ChatMessage(role="system", content=bot.instructions_parsed)] + bot.context[-bot.context_window:]
+      colors = {"user": fg.yellow, "assistant": fg.magenta, "system": fg.cyan}
+      messages_str = ""
+      for message in messages:
+        messages_str += fx.bold + colors[message.role] + message.role + ": " + fx.default + message.content + "\n"
+      messages_str = messages_str.encode("utf-8")
+      return {"content": messages_str, "format": "bash"}
+    if cmd[0] == "$change_instruction":
       return {"source": "system", "input_preset": "submit_instruction " + bot.instructions}
-    if cmd[0] == "submit_instruction":
+    if cmd[0] == "$append":
+      input = input[len("$append"):] + "\n" + last_output
+    if cmd[0] == "$submit_instruction":
       bot.set_instructions(" ".join(cmd[1:]))
       return {}
+    for i in range(len(cmd)):
+      if len(cmd[i]) > 0:
+        if cmd[i][0] == "~":
+          cmd[i] = re.sub(r'^~', os.path.expanduser('~'), cmd[i])
     if cmd[0] == "cd":
       os.chdir(cmd[1])
       return None
     if shutil.which(cmd[0]) is not None and cmd[0] != "write":
-      if cmd[0] == "ls":
-        cmd.append("--color=always")
-      res_txt = subprocess.run(cmd, capture_output=True).stdout
-      res_obj = {"source": "console", "format": "bash", "content": res_txt}
+      if cmd[0] in ["ls", "cat"]:
+        if cmd[0] == "ls":
+          cmd.append("--color=always")
+        res_txt = subprocess.run(cmd, capture_output=True).stdout
+        res_obj = {"source": "console", "format": "bash", "content": res_txt}
 
-      if cmd[0] == "cat":
-        res_txt = res_txt.decode('utf-8').strip()
-        path = "# file: " + cmd[1] + "\n"
-        res_obj = {"source": "console", "format": "code", "language": "python", "content": path+res_txt}
-      return res_obj
+        if cmd[0] == "cat":
+          res_txt = res_txt.decode('utf-8').strip()
+          path = "# file: " + cmd[1] + "\n"
+          res_obj = {"source": "console", "format": "code", "language": "python", "content": path+res_txt}
+        return res_obj
+      else:
+        process = subprocess.Popen(cmd, stdout=None, stderr=None)
+        process.wait()
+        res_txt = str(process.returncode)
 
-    if res_txt == "":
+    if res_txt == "" and len(cmd) > 1:
       res_obj = {"source": "chat", "format": "markdown", "content": bot.exec_query(input)}
     return res_obj 
 
@@ -160,17 +216,6 @@ def main():
          get_git_branch(),
          colored("$ ", 'cyan')]
       return ''.join(parts)
-  last_output = ""
-  def strip_ansi(text):
-    """Remove ANSI escape sequences from a string."""
-    ansi_escape = re.compile(r'''
-        \x1b   # ESC
-        \[     # [
-        [0-?]* # 0 or more characters in the range 0 to ?
-        [ -/]* # 0 or more characters in the range space to /
-        [@-~]  # one character in the range @ to ~
-    ''', re.VERBOSE)
-    return ansi_escape.sub('', text)
   input_preset = ""
   while True:
     # print(get_ps(), end="")
@@ -182,7 +227,7 @@ def main():
     if res is not None:
       if "source" in res:
         if res["source"] == "chat":
-          print(fx.bold + fg.magenta +'🤖 Bot:' + fx.default)
+          print(fx.bold + fg.magenta +'🤖 AI:' + fx.default)
       if "format" in res:
         if res["format"] == "markdown":
           csl.print(CustomMarkdown(res["content"], code_theme="tomorrownighteighties", inline_code_theme="tomorrownighteighties"))
@@ -190,10 +235,12 @@ def main():
           print(res["content"].decode('utf-8').strip())
         elif res["format"] == "code":
           csl.print(Syntax(res["content"], res["language"], theme=TomorrowNightTheme(), line_numbers=False))
-        print('\n')
+        
+        last_output = strip_ansi(res["content"])
+      
     
-    if "input_preset" in res:
-      input_preset = res["input_preset"]
+      if "input_preset" in res:
+        input_preset = res["input_preset"]
 
 if __name__ == '__main__':
   main()
