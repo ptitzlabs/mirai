@@ -20,6 +20,10 @@ from termcolor import colored
 import shutil
 import textwrap
 from mistralai.models.chat_completion import ChatMessage
+import requests
+import html2text
+from bs4 import BeautifulSoup
+from readability import Document as ReadDoc
 
 from bot_engine import Bot
 
@@ -28,7 +32,31 @@ from pymongo.server_api import ServerApi
 
 from command_parser import CommandParser
 
+
 bot = Bot()
+
+def html_to_markdown(html):
+    # Use Beautiful Soup to parse the HTML content
+    # soup = BeautifulSoup(html, 'html.parser')
+    readability_document = ReadDoc(html,positive_keywords=["section"])
+    
+    # Initialize html2text converter
+    converter = html2text.HTML2Text()
+    converter.ignore_links = False  # Set to True if you want to ignore converting links
+    converter.ignore_images = True  # Set to False if you want to include images in Markdown
+    converter.ignore_emphasis = False
+    converter.body_width = 0  # Set to 0 to prevent wrapping of lines
+
+    # Convert the HTML to Markdown
+    markdown = converter.handle(readability_document.summary())
+    return markdown
+
+def web_to_markdown(url):
+    # Get the HTML content of the URL
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3094.110 Safari/56.0.3"
+    response = requests.get(url, headers={'User-Agent': user_agent})
+    html = response.text
+    return html_to_markdown(html)
 
 def main():
   # Create custom key bindings
@@ -162,6 +190,12 @@ def main():
     if cmd[0] == "$submit_instruction":
       bot.set_instructions(" ".join(cmd[1:]))
       return {}
+    if cmd[0] == "$fetch":
+      md = web_to_markdown(cmd[1])
+      print(md)
+      input = "I'm going to ask you some questions about this article:\n" + md 
+    if cmd[0] == "$summarize":
+      input = "Summarize this article:\n" + web_to_markdown(cmd[1])
     for i in range(len(cmd)):
       if len(cmd[i]) > 0:
         if cmd[i][0] == "~":
